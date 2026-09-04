@@ -1,0 +1,200 @@
+# Frappe Helpdesk — its own stack, deliberately independent of SIS_BACKEND.
+#
+# Separate compose project, separate volumes, separate database engine. The SIS
+# never touches these tables; the two systems meet over HTTP only. A `docker
+# compose down` here cannot take the SIS with it, and `bench migrate` runs on a
+# schedule you choose rather than alongside a Django deploy.
+#
+# Bring up:  docker compose -f docker-compose.helpdesk.yml up -d
+# Logs:      docker compose -f docker-compose.helpdesk.yml logs -f create-site
+#
+# `configurator` and `create-site` are one-shot jobs. Seeing them Exited in
+# `docker compose ps` is correct — it is not a crash.
+
+x-image: &image
+  image: ${HELPDESK_IMAGE:-sis/frappe-helpdesk}:${HELPDESK_TAG:-v15}
+  pull_policy: never  # built locally by ./build-image.sh, never fetched
+
+x-backend-defaults: &backend-defaults
+  <<: *image
+  restart: unless-stopped
+  volumes:
+    - sites:/home/frappe/frappe-bench/sites
+    - logs:/home/frappe/frappe-bench/logs
+  depends_on:
+    configurator:
+      condition: service_completed_successfully
+
+services:
+  # --- data stores --------------------------------------------------------
+  # Frappe's own MariaDB. The character set and row format are not optional:
+  # without them site creation fails partway through with encoding errors.
+  db:
+    image: mariadb:10.6
+    restart: unless-stopped
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --skip-character-set-client-handshake
+      - --skip-innodb-read-only-compressed
+    environment:
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h localhost --password=$$MARIADB_ROOT_PASSWORD || mysqladmin ping -h localhost --password=$$MARIADB_ROOT_PASSWORD"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    # No host port published: nothing outside this stack has any business
+    # reaching Helpdesk's database. For direct access in dev, add
+    #   ports: ["3307:3306"]
+    # (3307 avoids colliding with a local MySQL; the SIS's Postgres is on 5437).
+
+  # Two Redis instances, not one, and not the SIS's. Frappe manages cache and
+  # queue databases assuming it owns them, and the SIS instance runs with
+  # requirepass, which Frappe does not expect.
+  redis-cache:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-cache-data:/data
+
+  redis-queue:
+    image: redis:6.2-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-queue-data:/data
+
+  # --- one-shot jobs ------------------------------------------------------
+  configurator:
+    <<: *image
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    # Literal block (|), not folded (>): a folded scalar keeps newlines on
+    # more-indented lines, which silently breaks multi-line shell commands.
+    command:
+      - |
+        set -e
+        bench set-config -g db_host "$$DB_HOST"
+        bench set-config -gp db_port "$$DB_PORT"
+        bench set-config -g redis_cache "redis://$$REDIS_CACHE"
+        bench set-config -g redis_queue "redis://$$REDIS_QUEUE"
+        bench set-config -g redis_socketio "redis://$$REDIS_QUEUE"
+        bench set-config -gp socketio_port "$$SOCKETIO_PORT"
+        echo "Bench configured."
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      REDIS_CACHE: redis-cache:6379
+      REDIS_QUEUE: redis-queue:6379
+      SOCKETIO_PORT: "9000"
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      db:
+        condition: service_healthy
+
+  create-site:
+    <<: *image
+    restart: "no"
+    entrypoint: ["bash", "-c"]
+    # Idempotent: re-running the stack does not attempt to recreate an existing
+    # site, so `up -d` is safe to repeat.
+    command:
+      - |
+        set -e
+        if [ -d "sites/$$SITE_NAME" ]; then
+          echo "Site $$SITE_NAME already exists — nothing to do."
+          exit 0
+        fi
+        bench new-site           --no-mariadb-socket           --admin-password "$$ADMIN_PASSWORD"           --db-root-password "$$DB_ROOT_PASSWORD"           --install-app helpdesk           --set-default           "$$SITE_NAME"
+        echo "Created $$SITE_NAME with Helpdesk installed."
+    environment:
+      SITE_NAME: ${SITE_NAME:?set SITE_NAME in .env}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD in .env}
+      DB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:?set DB_ROOT_PASSWORD in .env}
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  # --- long-running services ----------------------------------------------
+  backend:
+    <<: *backend-defaults
+
+  websocket:
+    <<: *image
+    restart: unless-stopped
+    command: ["node", "/home/frappe/frappe-bench/apps/frappe/socketio.js"]
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      configurator:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *backend-defaults
+    command: ["bench", "schedule"]
+
+  # Webhook delivery runs on the short queue. If these workers are down, events
+  # are lost silently — which is precisely why the SIS also polls.
+  queue-short:
+    <<: *backend-defaults
+    command: ["bench", "worker", "--queue", "short,default"]
+
+  queue-long:
+    <<: *backend-defaults
+    command: ["bench", "worker", "--queue", "long,default,short"]
+
+  frontend:
+    <<: *image
+    restart: unless-stopped
+    command: ["nginx-entrypoint.sh"]
+    environment:
+      BACKEND: backend:8000
+      SOCKETIO: websocket:9000
+      # Frappe resolves which site to serve from the Host header. Pinning the
+      # site name here means a request arriving by container name (from the SIS
+      # over an internal network) still lands on the right site.
+      FRAPPE_SITE_NAME_HEADER: ${SITE_NAME}
+      UPSTREAM_REAL_IP_ADDRESS: 127.0.0.1
+      UPSTREAM_REAL_IP_HEADER: X-Forwarded-For
+      UPSTREAM_REAL_IP_RECURSIVE: "off"
+      PROXY_READ_TIMEOUT: "120"
+      CLIENT_MAX_BODY_SIZE: 50m
+    volumes:
+      - sites:/home/frappe/frappe-bench/sites
+      - logs:/home/frappe/frappe-bench/logs
+    depends_on:
+      backend:
+        condition: service_started
+      websocket:
+        condition: service_started
+    ports:
+      # Non-standard on purpose: the SIS already publishes 8092/8099/5437/6381,
+      # so nothing here collides.
+      - "${HELPDESK_PORT:-8093}:8080"
+
+volumes:
+  # `sites` holds the site config AND every ticket attachment. A database-only
+  # backup loses all the files.
+  sites:
+  logs:
+  db-data:
+  redis-cache-data:
+  redis-queue-data:
+
+# Uncomment to let SIS_BACKEND reach this stack by container name instead of
+# going out through the public subdomain. Create it once with:
+#   docker network create sis-shared
+# then add the same block to the SIS compose files.
+#
+# networks:
+#   default:
+#     name: sis-shared
+#     external: true
