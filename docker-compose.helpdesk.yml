@@ -13,10 +13,7 @@
 
 x-image: &image
   image: ${HELPDESK_IMAGE:-sis/frappe-helpdesk}:${HELPDESK_TAG:-v15}
-  # Local machines build the image with ./build-image.sh, so the default never
-  # reaches a registry. CI sets HELPDESK_PULL_POLICY=always to deploy the image
-  # it just pushed to Docker Hub.
-  pull_policy: ${HELPDESK_PULL_POLICY:-missing}
+  pull_policy: never  # built locally by ./build-image.sh, never fetched
 
 x-backend-defaults: &backend-defaults
   <<: *image
@@ -181,7 +178,7 @@ services:
     ports:
       # Non-standard on purpose: the SIS already publishes 8092/8099/5437/6381,
       # so nothing here collides.
-      - 8090:8080
+      - "${HELPDESK_PORT:-8093}:8080"
 
 volumes:
   # `sites` holds the site config AND every ticket attachment. A database-only
