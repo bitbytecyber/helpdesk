@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """One-time (and safely repeatable) configuration of a Frappe Helpdesk site.
 
-Creates the pieces the SIS integration depends on:
+Creates the pieces the SIS integration depends on:""
 
   1. Five Custom Fields on HD Ticket, carrying what a requester claimed at intake.
   2. Three Webhook rows pointing back at the SIS, all signed with a shared secret.
