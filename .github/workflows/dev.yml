@@ -67,11 +67,13 @@ jobs:
           script: |
             set -euo pipefail
 
-            # This repo keeps the compose file and .env at its root -- there is
-            # no docker/ or config/ subdirectory here.
-            cd /root/helpdesk
-            test -f docker-compose.helpdesk.yml || { echo "docker-compose.helpdesk.yml not found in /root/helpdesk"; exit 1; }
-            test -f .env || { echo ".env not found in /root/helpdesk -- copy .env.example and fill it in"; exit 1; }
+            # Server layout, which differs from this repo's root: the compose
+            # file lives under docker/ and the environment under config/.
+            COMPOSE_FILE=/root/helpdesk/docker/docker-compose.helpdesk.yml
+            ENV_FILE=/root/helpdesk/config/.env.dev
+
+            test -f "$COMPOSE_FILE" || { echo "compose file not found: $COMPOSE_FILE"; exit 1; }
+            test -f "$ENV_FILE" || { echo "env file not found: $ENV_FILE"; exit 1; }
 
             # Compose interpolates from the shell environment before .env, so
             # these pin the stack to the image this run just pushed. The compose
@@ -81,7 +83,7 @@ jobs:
             export HELPDESK_TAG="$GITHUB_SHA"
             export HELPDESK_PULL_POLICY=always
 
-            COMPOSE="docker compose -f docker-compose.helpdesk.yml --env-file .env"
+            COMPOSE="docker compose -f $COMPOSE_FILE --env-file $ENV_FILE"
 
             echo "==> Deploying ${HELPDESK_IMAGE}:${HELPDESK_TAG}"
             $COMPOSE pull
@@ -95,7 +97,7 @@ jobs:
 
             # configurator and create-site are expected to be Exited; only the
             # long-running services have to answer.
-            PORT="$(grep -E '^HELPDESK_PORT=' .env | cut -d= -f2 | tr -d '[:space:]')"
+            PORT="$(grep -E '^HELPDESK_PORT=' "$ENV_FILE" | cut -d= -f2 | tr -d '[:space:]')"
             PORT="${PORT:-8093}"
             for i in $(seq 1 30); do
               if curl -fsS "http://localhost:${PORT}/api/method/ping" >/dev/null 2>&1; then
