@@ -16,6 +16,7 @@ jobs:
     name: Push Docker image to Docker Hub
     if: github.event.pull_request.merged == true
     runs-on: ubuntu-latest
+    timeout-minutes: 60
 
     steps:
       - name: Check out the repo
@@ -27,12 +28,26 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@ad44023a93711e3deb337508980b4b5e9bcdc5dc
-        with:
-          context: .
-          push: true
-          tags: ${{ env.IMAGE_NAME }}:${{ env.TAG }}
+      # There is no Dockerfile in this repo, and that is deliberate: Helpdesk
+      # ships in no official image, so the image is built from frappe_docker's
+      # upstream layered Containerfile with apps.json passed in as a BuildKit
+      # secret. build-image.sh owns the pinned frappe_docker ref, the Frappe
+      # branch and the cache-bust hash -- CI calls it rather than duplicating
+      # any of that in a build-push-action step.
+      - name: Build Docker image
+        env:
+          IMAGE: ${{ env.IMAGE_NAME }}
+          TAG: ${{ env.TAG }}
+        run: bash ./build-image.sh
+
+      - name: Push Docker image
+        run: |
+          set -euo pipefail
+          # Also tag the commit, so a bad dev build can be rolled back by
+          # redeploying a sha rather than rebuilding.
+          docker tag "$IMAGE_NAME:$TAG" "$IMAGE_NAME:$GITHUB_SHA"
+          docker push "$IMAGE_NAME:$TAG"
+          docker push "$IMAGE_NAME:$GITHUB_SHA"
 
   deploy:
     name: Deploy Docker Container on EC2
@@ -47,16 +62,53 @@ jobs:
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.HOST_USERNAME }}
           PASSWORD: ${{ secrets.HOST_PASSWORD }}
-          envs: IMAGE_NAME,GITHUB_SHA,COMMAND
+          envs: IMAGE_NAME,TAG,GITHUB_SHA
+          script_stop: true
           script: |
-            # The following command does three things
-            #   1. Stop and remove relevant running containers
-            #   2. Pull the latest images for the containers from Docker Hub
-            #   3. Run new containers using recently pulled images
+            set -euo pipefail
 
-            docker compose -f /root/helpdesk/docker/docker-compose.helpdesk.yml --env-file /root/helpdesk/config/.env.dev pull && \
-            docker compose -f /root/helpdesk/docker/docker-compose.helpdesk.yml --env-file /root/helpdesk/config/.env.dev down && \
-            docker compose -f /root/helpdesk/docker/docker-compose.helpdesk.yml --env-file /root/helpdesk/config/.env.dev up -d
+            # This repo keeps the compose file and .env at its root -- there is
+            # no docker/ or config/ subdirectory here.
+            cd /root/helpdesk
+            test -f docker-compose.helpdesk.yml || { echo "docker-compose.helpdesk.yml not found in /root/helpdesk"; exit 1; }
+            test -f .env || { echo ".env not found in /root/helpdesk -- copy .env.example and fill it in"; exit 1; }
+
+            # Compose interpolates from the shell environment before .env, so
+            # these pin the stack to the image this run just pushed. The compose
+            # file's pull policy defaults to local-only for developer machines,
+            # which would otherwise make `pull` a silent no-op here.
+            export HELPDESK_IMAGE="$IMAGE_NAME"
+            export HELPDESK_TAG="$GITHUB_SHA"
+            export HELPDESK_PULL_POLICY=always
+
+            COMPOSE="docker compose -f docker-compose.helpdesk.yml --env-file .env"
+
+            echo "==> Deploying ${HELPDESK_IMAGE}:${HELPDESK_TAG}"
+            $COMPOSE pull
+            $COMPOSE down
+            $COMPOSE up -d
+
+            # The site lives in a named volume and survives the restart, so
+            # create-site short-circuits -- but a new image can carry schema
+            # changes, which is what migrate is for.
+            $COMPOSE exec -T backend bench --site all migrate
+
+            # configurator and create-site are expected to be Exited; only the
+            # long-running services have to answer.
+            PORT="$(grep -E '^HELPDESK_PORT=' .env | cut -d= -f2 | tr -d '[:space:]')"
+            PORT="${PORT:-8093}"
+            for i in $(seq 1 30); do
+              if curl -fsS "http://localhost:${PORT}/api/method/ping" >/dev/null 2>&1; then
+                echo "Helpdesk is up on port ${PORT}."
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "Frontend did not answer on port ${PORT} within 150s."
+            $COMPOSE ps
+            $COMPOSE logs --tail 100 backend frontend
+            exit 1
 
       - name: Send email
         if: always()
