@@ -25,10 +25,15 @@ than in production.
 
 Usage:
     pip install requests
-    python scripts/provision.py                # apply
-    python scripts/provision.py --dry-run      # show what would change
+    python scripts/provision.py --dry-run                     # show changes
+    python scripts/provision.py                               # apply
+    python scripts/provision.py --env-file .env.prod          # another site
 
-Reads configuration from ../.env (or the environment).
+Reads configuration from ../.env unless ``--env-file`` says otherwise; real
+environment variables override whatever the file holds. Keep one file per site
+— pointing this at the wrong Frappe is the easiest mistake to make and the
+hardest to notice, so the chosen file and the resolved URL are both echoed
+before anything is written.
 """
 
 from __future__ import annotations
@@ -45,7 +50,7 @@ except ImportError:
     sys.exit("This script needs `requests`:  pip install requests")
 
 HERE = pathlib.Path(__file__).resolve().parent
-ENV_FILE = HERE.parent / ".env"
+DEFAULT_ENV_FILE = HERE.parent / ".env"
 
 TICKET_DOCTYPE = "HD Ticket"
 
@@ -124,10 +129,18 @@ CUSTOM_FIELDS: list[dict[str, Any]] = [
     },
 ]
 
-def load_env() -> dict[str, str]:
+def load_env(env_file: pathlib.Path) -> dict[str, str]:
+    """Values from an env file, with real environment variables winning.
+
+    The file is chosen per run (``--env-file``) rather than fixed, because this
+    script is routinely pointed at more than one site — a local stack and a
+    production one — from the same checkout. Defaulting to ``.env`` and having
+    no way to override it is how a run meant for production silently configures
+    localhost, or worse, sends production credentials at a local Host header.
+    """
     env: dict[str, str] = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
+    if env_file.exists():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -388,9 +401,18 @@ def disable_obsolete_webhooks(api: Frappe, dry_run: bool) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="show changes without applying")
+    parser.add_argument(
+        "--env-file",
+        default=str(DEFAULT_ENV_FILE),
+        help="env file to read (default: ../.env). Use a separate file per site.",
+    )
     args = parser.parse_args()
 
-    env = load_env()
+    env_file = pathlib.Path(args.env_file).expanduser()
+    if not env_file.exists() and args.env_file != str(DEFAULT_ENV_FILE):
+        print(f"Env file not found: {env_file}", file=sys.stderr)
+        return 2
+    env = load_env(env_file)
     missing = [k for k in ("FRAPPE_URL", "ADMIN_API_KEY", "ADMIN_API_SECRET")
                if not env.get(k)]
     if missing:
@@ -411,6 +433,9 @@ def main() -> int:
     except Exception as exc:
         print(f"Could not reach Frappe at {env['FRAPPE_URL']}: {exc}", file=sys.stderr)
         return 1
+    # The env file is echoed because pointing this at the wrong site is the
+    # mistake worth catching, and it is invisible otherwise.
+    print(f"Env file: {env_file}")
     print(f"Connected to {env['FRAPPE_URL']} as {user}"
           + (" (DRY RUN — nothing will be written)" if args.dry_run else ""))
 
