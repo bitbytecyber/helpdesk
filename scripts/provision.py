@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
 """One-time (and safely repeatable) configuration of a Frappe Helpdesk site.
 
-Creates the pieces the SIS integration depends on:""
+Creates the pieces the SIS integration depends on:
 
-  1. Five Custom Fields on HD Ticket, carrying what a requester claimed at intake.
-  2. Three Webhook rows pointing back at the SIS, all signed with a shared secret.
+  1. Six Custom Fields on HD Ticket — the identifiers a ticket is later found
+     by, plus what the requester claimed at intake.
+  2. One Webhook, firing when a ticket is resolved or closed, so the SIS can
+     raise an in-app notification for the requester. This is the only thing
+     Frappe pushes back: there is no ticket mirror to keep up to date.
+
+It also *disables* the two other webhook rows earlier versions of this script
+created (ticket created, reply added). Those fed the mirror and now point at
+nothing; left enabled, Frappe retries them against a 404 forever and fills
+Webhook Request Log with noise.
 
 Everything is idempotent — it checks before it creates, and updates in place
 when a value has drifted — so running it after a Frappe upgrade or against a
@@ -45,6 +53,10 @@ TICKET_DOCTYPE = "HD Ticket"
 # support/services/frappe_client.py (TicketPayload.to_doc). They must match
 # exactly — Frappe silently drops unknown keys on insert, so a typo here shows
 # up as tickets that simply have no phone number on them.
+#
+# `sis_user_id` additionally carries the whole ownership model: the SIS queries
+# HD Ticket by it to build "My Tickets", so a missing field here does not fail
+# loudly — it just makes every portal ticket list permanently empty.
 CUSTOM_FIELDS: list[dict[str, Any]] = [
     {
         "fieldname": "sis_section_break",
@@ -62,11 +74,25 @@ CUSTOM_FIELDS: list[dict[str, Any]] = [
         "description": "As the requester typed it. What to dial — not proof of identity.",
     },
     {
+        "fieldname": "sis_phone_key",
+        "label": "Phone (match key)",
+        "fieldtype": "Data",
+        "insert_after": "sis_phone",
+        "read_only": 1,
+        "in_standard_filter": 1,
+        "description": (
+            "The phone number's last 10 digits, written by the SIS at intake. "
+            "This — never sis_phone — is what the anonymous ticket lookup "
+            "matches on: '+923001234567' and '0300-1234567' are one number and "
+            "two strings, and Frappe cannot normalise inside a filter."
+        ),
+    },
+    {
         "fieldname": "sis_email",
         "label": "Email (claimed)",
         "fieldtype": "Data",
         "options": "Email",
-        "insert_after": "sis_phone",
+        "insert_after": "sis_phone_key",
     },
     {
         "fieldname": "sis_admission_no",
@@ -83,50 +109,20 @@ CUSTOM_FIELDS: list[dict[str, Any]] = [
         "read_only": 1,
     },
     {
-        "fieldname": "sis_link_status",
-        "label": "SIS link status",
+        "fieldname": "sis_user_id",
+        "label": "SIS user id",
         "fieldtype": "Data",
         "insert_after": "sis_campus_id",
         "read_only": 1,
+        "in_standard_filter": 1,
         "description": (
-            "How far the ticket->family link is trusted. Anything other than "
-            "verified_* came from an unproven phone number: treat it as a "
-            "suggestion, and confirm identity before disclosing anything."
+            "The SIS user who raised this ticket while signed in. Written by "
+            "the SIS and by nothing else, which is what makes it safe to serve "
+            "a portal ticket list from. Blank on anonymously-raised tickets — "
+            "and a blank value must never match a caller."
         ),
     },
 ]
-
-# Payloads carry ONLY the fields listed here. Omitting `name` or `modified` is
-# the single most common webhook misconfiguration: the SIS then cannot identify
-# the ticket, or cannot tell a duplicate delivery from a real update.
-TICKET_WEBHOOK_FIELDS = [
-    "name",
-    "subject",
-    "status",
-    "priority",
-    "modified",
-    "opening_date",
-    "first_responded_on",
-    "resolution_date",
-    "sis_phone",
-    "sis_email",
-    "sis_admission_no",
-    "sis_campus_id",
-    "sis_link_status",
-]
-
-# A Communication row does not know it is "a ticket reply" — it points at its
-# parent through reference_doctype/reference_name. Without those two the SIS
-# receives a message body with nothing to attach it to.
-COMMUNICATION_WEBHOOK_FIELDS = [
-    "name",
-    "reference_doctype",
-    "reference_name",
-    "communication_type",
-    "sent_or_received",
-    "modified",
-]
-
 
 def load_env() -> dict[str, str]:
     env: dict[str, str] = {}
@@ -168,13 +164,23 @@ class Frappe:
         r.raise_for_status()
         return r.json().get("data")
 
-    def find(self, doctype: str, filters: list) -> dict | None:
+    def find(self, doctype: str, filters: list, fields: list[str] | None = None) -> dict | None:
+        """One matching row.
+
+        ``fields`` is not optional in spirit: a Frappe list query with no field
+        list returns **only** ``name``. Ask for a field you did not request and
+        you get ``None`` back, silently — which reads as "this value is unset"
+        rather than "you did not fetch it". That mistake is what let
+        ``disable_obsolete_webhooks`` report "already disabled" for rows that
+        were in fact enabled.
+        """
         import json as _json
 
+        params = {"filters": _json.dumps(filters), "limit_page_length": 1}
+        if fields:
+            params["fields"] = _json.dumps(fields)
         r = self.session.get(
-            self._url(f"/api/resource/{doctype}"),
-            params={"filters": _json.dumps(filters), "limit_page_length": 1},
-            timeout=30,
+            self._url(f"/api/resource/{doctype}"), params=params, timeout=30
         )
         r.raise_for_status()
         rows = r.json().get("data") or []
@@ -217,100 +223,166 @@ def ensure_custom_fields(api: Frappe, dry_run: bool) -> None:
         print(f"   created  {spec['fieldname']}")
 
 
-def webhook_spec(name: str, doctype: str, event: str, fields: list[str], url: str, secret: str,
-                 condition: str = "") -> dict:
-    # Webhook's autoname is "prompt" (naming_rule: "Set by user") — Frappe
-    # will not assign a name on its own, and insert() 417s with "Please set
-    # the document name" if one isn't supplied.
-    #
-    # enable_security is not cosmetic: frappe/integrations/doctype/webhook/
-    # webhook.py only computes and sends X-Frappe-Webhook-Signature when this
-    # is set — webhook_secret sits inert (and is even hidden in the Desk UI,
-    # via depends_on: eval:doc.enable_security==1) otherwise. Omitting it
-    # doesn't error; Frappe just silently ships unsigned requests, which the
-    # SIS then correctly rejects as unauthenticated. Confirmed by reading the
-    # signing code directly: it reuses the same frappe.as_json(data) for both
-    # the signature and the request body, so there's no other place this can
-    # drift once security is actually turned on.
-    # request_structure is deliberately left unset (NOT "JSON"). Reading
-    # Webhook.validate_request_body() directly: when request_structure ==
-    # "JSON" it unconditionally does `self.webhook_data = []` on every save —
-    # the field list is then expected to come from a separate Jinja-templated
-    # `webhook_json` field instead. get_webhook_data() only falls back to
-    # webhook_json when webhook_data is empty, so setting both (as an earlier
-    # version of this script did) silently produces an EMPTY payload: Frappe
-    # sends "{}" as the body, `enable_security` was still added as its digest,
-    # so the request even carries a *valid* signature over nothing — the SIS
-    # then rejects it for real, but for "no name in payload", not "bad sig".
-    # This costs nothing: enqueue_webhook always sends `frappe.as_json(data)`
-    # regardless of request_structure, so leaving it unset changes nothing
-    # about how the bytes are transmitted — only how the field list survives.
+# Payload for the one webhook that still exists. Frappe sends ONLY the fields
+# listed in a webhook's Webhook Data table — never the whole document — so an
+# omission here is silent: the SIS receives a payload it cannot act on.
+#
+#   name           which ticket. Without it there is nothing to identify.
+#   status         the SIS notifies only on Resolved/Closed, and this is how it
+#                  tells. Without it every event looks like "not resolved".
+#   sis_user_id    who to notify, when the ticket was raised from a session.
+#   sis_phone_key  who to notify otherwise — the SIS resolves the person whose
+#                  own mobile number this is, the same signal the portal ticket
+#                  list uses. Omit it and every anonymously-raised ticket goes
+#                  quiet on resolution while still being visible in that
+#                  person's portal.
+#   subject        display text in the notification.
+#   modified       not used for correctness (the SIS keys idempotency off
+#                  name+status), but invaluable when reading Webhook Request Log.
+TICKET_EVENT_FIELDS = [
+    "name",
+    "status",
+    "subject",
+    "sis_user_id",
+    "sis_phone_key",
+    "modified",
+]
+
+# `on_update` fires on every save. The condition keeps the noise off the wire;
+# the SIS re-checks the status anyway, because a condition is configuration and
+# configuration drifts.
+TICKET_EVENT_CONDITION = 'doc.status in ("Resolved", "Closed")'
+
+WEBHOOK_NAME = "SIS - HD Ticket - Resolved"
+
+
+def ticket_event_webhook(url: str, secret: str) -> dict:
+    """The Webhook row that tells the SIS a ticket closed.
+
+    Two settings here are not cosmetic and both fail *silently* if undone —
+    each was found by tracing a real end-to-end failure during first setup:
+
+    `enable_security` gates the signature entirely.
+    ``Webhook.get_webhook_headers()`` only computes and sends
+    ``X-Frappe-Webhook-Signature`` when it is set; ``webhook_secret`` sits inert
+    otherwise, and is hidden in the Desk UI unless the box is ticked. Leave it
+    off and Frappe ships unsigned requests, which the SIS correctly rejects as
+    unauthenticated — but the error is indistinguishable from a wrong secret.
+
+    `request_structure` must NOT be "JSON". ``Webhook.validate_request_body()``
+    unconditionally runs ``self.webhook_data = []`` on every save while that
+    field equals "JSON" — the field table and the Jinja-templated
+    ``webhook_json`` field are mutually exclusive, and "JSON" is Frappe's way of
+    saying "use the template, not the table". Set both and ``webhook_data`` is
+    wiped on save; the webhook then ships "{}" as its body — correctly signed,
+    since signing happens over whatever ``data`` ends up being — so the SIS sees
+    a *validly signed empty payload* and rejects it for a missing name, not for
+    a bad signature.
+
+    Webhook's autoname is "prompt", so a name must be supplied or ``insert()``
+    417s with "Please set the document name".
+    """
     return {
         "doctype": "Webhook",
-        "name": name,
-        "webhook_doctype": doctype,
-        "webhook_docevent": event,
+        "name": WEBHOOK_NAME,
+        "webhook_doctype": TICKET_DOCTYPE,
+        "webhook_docevent": "on_update",
         "request_url": url,
         "request_method": "POST",
         "enable_security": 1,
         "webhook_secret": secret,
-        "condition": condition,
+        "condition": TICKET_EVENT_CONDITION,
         "enabled": 1,
-        "webhook_data": [{"fieldname": f, "key": f} for f in fields],
+        "webhook_data": [{"fieldname": f, "key": f} for f in TICKET_EVENT_FIELDS],
     }
 
 
-def ensure_webhooks(api: Frappe, url: str, secret: str, dry_run: bool) -> None:
-    print("\n== Webhooks -> SIS ==")
-    wanted = [
-        ("ticket created", webhook_spec(
-            "SIS - HD Ticket - After Insert",
-            TICKET_DOCTYPE, "after_insert", TICKET_WEBHOOK_FIELDS, url, secret)),
-        ("ticket changed", webhook_spec(
-            "SIS - HD Ticket - On Update",
-            TICKET_DOCTYPE, "on_update", TICKET_WEBHOOK_FIELDS, url, secret)),
-        # Scoped, or the SIS receives every email in the system.
-        ("reply added", webhook_spec(
-            "SIS - Communication - After Insert",
-            "Communication", "after_insert", COMMUNICATION_WEBHOOK_FIELDS, url, secret,
-            condition='doc.reference_doctype == "HD Ticket"')),
-    ]
-
-    for label, spec in wanted:
-        existing = api.find("Webhook", [
-            ["webhook_doctype", "=", spec["webhook_doctype"]],
-            ["webhook_docevent", "=", spec["webhook_docevent"]],
+def ensure_ticket_webhook(api: Frappe, url: str, secret: str, dry_run: bool) -> None:
+    """Create or refresh the resolved/closed notification webhook."""
+    print("\n== Webhook -> SIS (ticket resolved) ==")
+    spec = ticket_event_webhook(url, secret)
+    existing = api.find(
+        "Webhook",
+        [
+            ["webhook_doctype", "=", TICKET_DOCTYPE],
+            ["webhook_docevent", "=", "on_update"],
             ["request_url", "=", url],
-        ])
-        if existing:
-            if dry_run:
-                print(f"   ok       {label} (would refresh secret and field list)")
-            else:
-                # Refresh in place: a rotated secret or an added custom field
-                # has to reach an already-created webhook.
-                #
-                # request_structure is explicitly reset to "" here, not
-                # merely omitted: a row created before this fix has it stuck
-                # at "JSON", and Webhook.validate_request_body() wipes
-                # webhook_data on every future save as long as that value
-                # remains — omitting the key from this payload would leave
-                # the stale value in place and the row would keep silently
-                # losing its field list each time provision.py runs.
-                api.update("Webhook", existing["name"], {
-                    "enable_security": 1,
-                    "webhook_secret": secret,
-                    "enabled": 1,
-                    "request_structure": "",
-                    "webhook_data": spec["webhook_data"],
-                    "condition": spec["condition"],
-                })
-                print(f"   updated  {label}  [{existing['name']}]")
+        ],
+    )
+    if existing:
+        if dry_run:
+            print("   ok       resolved/closed (would refresh secret and field list)")
+            return
+        # Refreshed in place: a rotated secret or an added field has to reach a
+        # row that already exists. `request_structure` is explicitly reset to ""
+        # rather than omitted — a row created before this was understood has it
+        # stuck at "JSON", and merely leaving the key out of an update keeps the
+        # stale value, so the row would go on silently losing its field list on
+        # every future save.
+        api.update(
+            "Webhook",
+            existing["name"],
+            {
+                "enable_security": 1,
+                "webhook_secret": secret,
+                "enabled": 1,
+                "request_structure": "",
+                "condition": TICKET_EVENT_CONDITION,
+                "webhook_data": spec["webhook_data"],
+            },
+        )
+        print(f"   updated  resolved/closed  [{existing['name']}]")
+        return
+    if dry_run:
+        print("   +create  resolved/closed: HD Ticket / on_update")
+        return
+    created = api.insert(spec)
+    print(f"   created  resolved/closed  [{created.get('name')}]")
+
+
+def disable_obsolete_webhooks(api: Frappe, dry_run: bool) -> None:
+    """Turn off the two webhooks that no longer have a receiver.
+
+    Earlier versions of this script created three rows, all feeding a SIS-side
+    ticket mirror that no longer exists. Only the ticket ``on_update`` row still
+    has a purpose (notifying a requester their ticket closed) and is handled by
+    ``ensure_ticket_webhook``; these two do not.
+
+    A row left enabled does not fail safely — Frappe's RQ worker retries into a
+    404 on every ticket creation and every reply, and Webhook Request Log fills
+    with errors that read like an integration fault rather than a decommissioned
+    one. Disabled rather than deleted, so a rollback is a checkbox and the
+    request history stays readable.
+    """
+    print("\n== Obsolete webhooks ==")
+    obsolete = [
+        ("ticket created", TICKET_DOCTYPE, "after_insert"),
+        ("reply added", "Communication", "after_insert"),
+    ]
+    found = False
+    for label, doctype, event in obsolete:
+        row = api.find(
+            "Webhook",
+            [
+                ["webhook_doctype", "=", doctype],
+                ["webhook_docevent", "=", event],
+                ["request_url", "like", "%/support/webhooks/frappe/%"],
+            ],
+            fields=["name", "enabled"],
+        )
+        if not row:
+            continue
+        found = True
+        if not row.get("enabled"):
+            print(f"   ok       {label} (already disabled)")
             continue
         if dry_run:
-            print(f"   +create  {label}: {spec['webhook_doctype']} / {spec['webhook_docevent']}")
+            print(f"   -disable {label}  [{row['name']}]")
             continue
-        created = api.insert(spec)
-        print(f"   created  {label}  [{created.get('name')}]")
+        api.update("Webhook", row["name"], {"enabled": 0})
+        print(f"   disabled {label}  [{row['name']}]")
+    if not found:
+        print("   ok       none present")
 
 
 def main() -> int:
@@ -319,12 +391,15 @@ def main() -> int:
     args = parser.parse_args()
 
     env = load_env()
-    missing = [k for k in ("FRAPPE_URL", "ADMIN_API_KEY", "ADMIN_API_SECRET",
-                           "SIS_WEBHOOK_URL", "WEBHOOK_SECRET") if not env.get(k)]
+    missing = [k for k in ("FRAPPE_URL", "ADMIN_API_KEY", "ADMIN_API_SECRET")
+               if not env.get(k)]
     if missing:
         print("Missing required settings in .env: " + ", ".join(missing), file=sys.stderr)
         print("See .env.example and docs/helpdesk-setup.md.", file=sys.stderr)
         return 2
+
+    webhook_url = env.get("SIS_WEBHOOK_URL", "").strip()
+    webhook_secret = env.get("WEBHOOK_SECRET", "").strip()
 
     api = Frappe(
         env["FRAPPE_URL"], env["ADMIN_API_KEY"], env["ADMIN_API_SECRET"],
@@ -341,14 +416,25 @@ def main() -> int:
 
     try:
         ensure_custom_fields(api, args.dry_run)
-        ensure_webhooks(api, env["SIS_WEBHOOK_URL"], env["WEBHOOK_SECRET"], args.dry_run)
+        disable_obsolete_webhooks(api, args.dry_run)
+        # Optional: the custom fields are the hard requirement, the notification
+        # webhook is not. Skipping rather than failing keeps this script usable
+        # for a fields-only run against a site whose SIS URL is not known yet.
+        if webhook_url and webhook_secret:
+            ensure_ticket_webhook(api, webhook_url, webhook_secret, args.dry_run)
+        else:
+            print("\n== Webhook -> SIS (ticket resolved) ==")
+            print("   skipped  SIS_WEBHOOK_URL / WEBHOOK_SECRET not set")
     except Exception as exc:
         print(f"\nFailed: {exc}", file=sys.stderr)
         return 1
 
     print("\nDone." if not args.dry_run else "\nDry run complete.")
-    print("Reminder: WEBHOOK_SECRET here must equal HELPDESK_WEBHOOK_SECRET in the SIS,")
-    print("or every delivery is rejected with a 401.")
+    print("Reminder: sis_user_id must exist before the SIS is switched over, or")
+    print("every portal ticket list comes back empty with no error anywhere.")
+    if webhook_url and webhook_secret:
+        print("WEBHOOK_SECRET here must equal HELPDESK_WEBHOOK_SECRET in the SIS,")
+        print("or every resolved-ticket notification is rejected with a 401.")
     return 0
 
 
